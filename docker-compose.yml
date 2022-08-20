@@ -1,0 +1,185 @@
+version: '3.9'
+
+networks:
+  default:
+    name: homer7
+  cnet:
+    name: cnet
+    external: true
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ${PROMETHEUS_HOST}
+    hostname: ${PROMETHEUS_HOST}
+    volumes:
+      - "${PWD}/config/prometheus:/etc/prometheus"
+      - "${STORAGE}/prometheus:/prometheus"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME}'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "50m"
+    networks:
+      - default
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ${GRAFANA_HOST}
+    hostname: ${GRAFANA_HOST}
+    volumes:
+      - "${PWD}/config/grafana:/etc/grafana"
+      - "${STORAGE}/grafana:/var/lib/grafana"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_OAUTH_AUTO_LOGIN=true
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASS:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_EXPLORE_ENABLED=true
+      - LOKI_HOST=${LOKI_HOST}
+      - LOKI_PORT=${LOKI_PORT}
+      - PROMETHEUS_HOST=${PROMETHEUS_HOST}
+      - PROMETHEUS_PORT=${PROMETHEUS_PORT}
+    restart: unless-stopped
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://127.0.0.1:${GRAFANA_PORT}/api/health || exit 1
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    logging:
+      options:
+        max-size: "50m"
+    networks:
+      - default
+      - cnet
+
+  loki:
+    image: grafana/loki
+    container_name: ${LOKI_HOST}
+    hostname: ${LOKI_HOST}
+    volumes:
+      - "${PWD}/config/loki:/etc/loki"
+      - "${STORAGE}/loki:/loki"
+    environment:
+      - LOKI_PORT=${LOKI_PORT}
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    command:
+      - '-config.file=/etc/loki/loki.yaml'
+      - '-config.expand-env=true'
+    restart: unless-stopped
+    healthcheck:
+      test: wget -q --tries=1 -O- http://127.0.0.1:${LOKI_PORT}/ready|grep -q "ready"
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    logging:
+      options:
+        max-size: "50m"
+    networks:
+      - default
+
+  heplify-server:
+    image: sipcapture/heplify-server
+    container_name: ${HEPLIFY_HOST}
+    hostname: ${HEPLIFY_HOST}
+    ports:
+      - "9060:9060"
+      - "9060:9060/udp"
+      - "9061:9061/tcp"
+    command:
+      - './heplify-server'
+    environment:
+      - "HEPLIFYSERVER_HEPADDR=0.0.0.0:9060"
+      - "HEPLIFYSERVER_HEPTCPADDR=0.0.0.0:9061"
+      - "HEPLIFYSERVER_DBSHEMA=homer7"
+      - "HEPLIFYSERVER_DBDRIVER=postgres"
+      - "HEPLIFYSERVER_DBADDR=${POSTGRES_HOST}:5432"
+      - "HEPLIFYSERVER_DBUSER=${POSTGRES_USER}"
+      - "HEPLIFYSERVER_DBPASS=${POSTGRES_PASS}"
+      - "HEPLIFYSERVER_DBDATATABLE=homer_data"
+      - "HEPLIFYSERVER_DBCONFTABLE=homer_config"
+      - "HEPLIFYSERVER_DBROTATE=${HEPLIFY_ROTATE}"
+      - "HEPLIFYSERVER_DBDROPDAYS=${HEPLIFY_DROPDAYS}"
+      - "HEPLIFYSERVER_LOGLVL=${HEPLIFY_LOG_LEVEL}"
+      - "HEPLIFYSERVER_LOGSTD=true"
+      - "HEPLIFYSERVER_PROMADDR=0.0.0.0:9096"
+      - "HEPLIFYSERVER_DEDUP=false"
+      - "HEPLIFYSERVER_LOKIURL=http://${LOKI_HOST}:${LOKI_PORT}/api/prom/push"
+      - "HEPLIFYSERVER_LOKITIMER=2"
+      - "HEPLIFYSERVER_ALEGIDS=X-CID"
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - homerdb
+    logging:
+      options:
+        max-size: "50m"
+    networks:
+      - default
+
+  homer-webapp:
+    build: ./homer-webapp
+    image: halsbox/homer-webapp:latest
+    container_name: ${HOMER_APP_HOST}
+    hostname: ${HOMER_APP_HOST}
+    environment:
+      - LOKI_HOST=${LOKI_HOST}
+      - LOKI_PORT=${LOKI_PORT}
+      - LOKI_USER=${LOKI_USER}
+      - LOKI_PASS=${LOKI_PASS}
+      - PROM_HOST=${PROMETHEUS_HOST}
+      - PROM_PORT=${PROMETHEUS_PORT}
+      - PROM_USER=${PROMETHEUS_USER}
+      - PROM_PASS=${PROMETHEUS_PASS}
+      - GRAFANA_HOST=${GRAFANA_HOST}
+      - GRAFANA_PORT=${GRAFANA_PORT}
+      - GRAFANA_TOKEN=${GRAFANA_TOKEN}
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASS=${POSTGRES_PASS}
+      - HOMER_LOGLEVEL=${HOMER_LOG_LEVEL}
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "50m"
+    depends_on:
+      homerdb:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+    networks:
+      - default
+      - cnet
+
+  homerdb:
+    image: postgres:13-alpine
+    container_name: ${POSTGRES_HOST}
+    hostname: ${POSTGRES_HOST}
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASS}
+      POSTGRES_USER: ${POSTGRES_USER}
+    volumes:
+      - "${PWD}/config/postgres:/docker-entrypoint-initdb.d"
+      - "${STORAGE}/potgres:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'pg_isready -U ${POSTGRES_USER}'"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      - grafana
+    logging:
+      options:
+        max-size: "50m"
+    networks:
+      - default
+
